@@ -1,8 +1,8 @@
 <h1 align="center">Model Diff to LoRA for ComfyUI</h1>
 
 <p align="center">
-  Extract a LoRA from the difference between two <code>MODEL</code> objects.<br>
-  Capture the result of any model edit — block-level tweaks, merges, IP-Adapter chains, custom patches — into a single distributable <code>.safetensors</code> file.
+  Bake any chain of LoRAs (and any other model edits) into a single distributable <code>.safetensors</code> LoRA.<br>
+  Load 3 LoRAs at the strengths you want, run this node, and walk away with one combined LoRA file you can ship anywhere.
 </p>
 
 <p align="center">
@@ -13,16 +13,52 @@
 
 ## What it does
 
-Give the node two `MODEL` objects: one is your "before" (typically the unmodified base), the other is your "after" (with whatever edits you've applied — chained LoRAs, block-level scaling, merge results, IP-Adapter, custom patches, anything). The node walks every trainable weight, computes the per-tensor difference, runs SVD to factor each diff into low-rank LoRA `up` / `down` matrices, and saves the result as a standard `.safetensors` LoRA.
+Give the node two `MODEL` objects:
 
-The output LoRA, applied at strength 1.0 to the "before" model, reproduces the "after" model's behaviour. So whatever transformation you'd been doing live in your workflow gets baked into a single portable file.
+- `model_before` — your unmodified base model
+- `model_after` — the same base with whatever LoRAs (and/or other edits) loaded onto it
 
-## When you'd use it
+The node walks every trainable weight, computes the per-tensor difference, runs SVD to factor each diff into low-rank LoRA `up` / `down` matrices, and saves the result as a standard `.safetensors` LoRA file.
 
-- **Distillation of a node chain** — you've got a workflow that loads model + 3 LoRAs + a layer-scaler + an IP-Adapter, and you want to ship the combined effect as one LoRA.
-- **Merge-to-LoRA** — you merged two checkpoints in some external tool and want a smaller LoRA that captures the merge delta.
-- **Custom patch capture** — you wrote a one-off model patch and want to share it with someone who doesn't have your patch code.
-- **Block-edit baking** — you scaled specific transformer blocks and want to save that as a portable file.
+The output LoRA, applied at strength 1.0 to the original base, reproduces the "after" model's behaviour. So whatever combination of LoRAs you had loaded gets baked into one portable file.
+
+## Primary use case: combine multiple LoRAs into one
+
+The most common reason to reach for this node:
+
+```
+[Load Checkpoint] ──► model_before
+       │
+       ▼
+[LoRA Loader: identity.safetensors @ 1.0]
+       │
+       ▼
+[LoRA Loader: style.safetensors @ 0.7]
+       │
+       ▼
+[LoRA Loader: details.safetensors @ 0.5] ──► model_after
+       │
+       └─────────────────────► Model Diff to LoRA ──► combined.safetensors
+                                          ▲
+                                          │
+                  model_before ────────────┘
+```
+
+You experiment with stacking LoRAs at the strengths that produce the look you want — identity at 1.0, style at 0.7, details at 0.5 — and once you're happy, this node bakes that *exact* combination into a single file. Now you can:
+
+- Share one LoRA instead of "use these three with these strengths"
+- Get back to the same look with one drop-down instead of three loaders + three strength sliders
+- Use the combined LoRA as the base for further mixing
+- Save a "preset" of your favourite multi-LoRA stack
+
+## Other things it captures
+
+It's not LoRAs-only. The node captures any difference between the two `MODEL` objects, so it also handles:
+
+- **Block-level scaling** (e.g. layer-scaler nodes that boost / suppress specific transformer blocks)
+- **External merges** — if you merged two checkpoints in another tool and want a small LoRA that captures the merge delta rather than shipping a whole new checkpoint
+- **IP-Adapter and other patch-style edits** — anything ComfyUI applies as a `model_patcher.patches` entry gets correctly baked in
+- **Custom one-off patches** — useful for sharing edits with someone who doesn't have your patch code
 
 ## Inputs
 
