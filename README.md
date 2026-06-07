@@ -64,14 +64,14 @@ It's not LoRAs-only. The node captures any difference between the two `MODEL` ob
 
 | Input | Type | Purpose |
 |---|---|---|
+| `enabled` | BOOLEAN | Run the extraction when queued. Default **on**; it auto-disables after a successful save so it sits dormant until you re-enable it. |
 | `model_before` | MODEL | The baseline (unmodified) model |
 | `model_after` | MODEL | The same model with whatever edits applied |
-| `rank` | INT | Target LoRA rank (typical: 4–64; higher = more faithful, larger file) |
-| `threshold` | FLOAT | Skip layers whose diff norm is below this — keeps the LoRA small by ignoring noise |
-| `output_name` | STRING | Filename for the saved `.safetensors` |
-| `output_path` | STRING | Where to save (relative to ComfyUI/models/loras by default) |
-| `svd_device` | DROPDOWN | `cuda` (fast) or `cpu` (universal). GPU is dramatically faster on big models. |
-| `enable` | BOOLEAN | Toggle to actually run the extraction. Default off so the node sits dormant until you want it to fire. |
+| `output_rank` | INT | Target LoRA rank (default 64, range 4–256; higher = more faithful, larger file) |
+| `output_path` | STRING | Save directory. Leave empty for `ComfyUI/output/extracted_loras`. Remembers the last path you used. |
+| `output_name` | STRING | Filename prefix for the saved `.safetensors` (a timestamp is appended). Remembers the last name you used. |
+
+The SVD device is chosen automatically — CUDA if a GPU is available, otherwise CPU. Layers whose difference is essentially numerical noise are skipped automatically (internal threshold) to keep the file small.
 
 ## Outputs
 
@@ -84,16 +84,17 @@ It's not LoRAs-only. The node captures any difference between the two `MODEL` ob
 
 1. Drop the `comfyui-model-diff-to-lora` folder into `ComfyUI/custom_nodes/`.
 2. Restart ComfyUI.
-3. Add the **Model Diff to LoRA** node from the `loaders` / `lora` area.
-4. Wire `before` and `after` MODEL inputs, set the rank, click Queue.
+3. Add the **Model Diff to LoRA** node from the `loaders/lora` category.
+4. Wire `model_before` and `model_after`, set `output_rank`, and click Queue (`enabled` is on by default).
 
 No pip installs needed beyond what ComfyUI already ships with.
 
 ## Notes
 
-- **Rank choice.** Higher rank = larger file but closer reproduction of the diff. For most edits, rank 16–32 captures >95% of the signal. For very subtle edits, rank 4 may be enough.
-- **Threshold.** The default skips layers where the difference is essentially numerical noise — keeps file size sensible. Drop to 0 to extract everything.
-- **GPU SVD.** If your "before" and "after" are big (Flux, SDXL), CPU SVD can take minutes. CUDA SVD is typically seconds to tens of seconds. Use CUDA unless you're memory-constrained.
+- **Rank choice.** Higher `output_rank` = larger file but closer reproduction of the diff. For most edits, rank 16–32 captures >95% of the signal; for very subtle edits, rank 4 may be enough. Default is 64.
+- **Noise threshold.** Layers whose difference is essentially numerical noise are skipped automatically so the file stays small — this is handled internally, nothing to configure.
+- **GPU SVD.** The device is selected automatically: CUDA when a GPU is available, otherwise CPU. On big models (Flux, SDXL) CPU SVD can take minutes while CUDA is typically seconds to tens of seconds.
+- **Auto-disable.** `enabled` is on by default and turns itself off after a successful save, so the node won't silently re-extract on your next Queue — flip it back on when you want to run again.
 - **The node honours patches.** ComfyUI applies LoRAs and other modifications as `model_patcher.patches` rather than baking them into weights. This node detects patches on the input MODEL objects and applies them via `comfy.lora.calculate_weight()` before computing the diff — so your chained LoRAs and runtime patches are correctly captured.
 
 ## Support
@@ -101,3 +102,7 @@ No pip installs needed beyond what ComfyUI already ships with.
 If this saves you time or unlocks a workflow you couldn't ship before, consider buying me a coffee:
 
 <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
+
+## License
+
+MIT.
