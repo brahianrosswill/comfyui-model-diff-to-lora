@@ -300,22 +300,6 @@ def _svd_decompose_multi(weight_diff: torch.Tensor, ranks: list, device: str = '
         return {}
 
 
-def _parse_ranks(text: str, fallback: int) -> list:
-    """Parse '16, 32, 64, 128' into [16, 32, 64, 128]. Junk entries are ignored; an empty
-    or fully-invalid string falls back to the single-rank widget value."""
-    out = []
-    for part in re.split(r'[,\s]+', str(text or '')):
-        if not part:
-            continue
-        try:
-            v = int(part)
-        except ValueError:
-            continue
-        if v >= 1:
-            out.append(v)
-    return sorted(set(out)) if out else [int(fallback)]
-
-
 def _model_key_to_lora_key(model_key: str, architecture: str) -> str:
     """
     Transform a model weight key to LoRA naming convention.
@@ -481,14 +465,20 @@ class ModelDiffToLoRA:
                     "min": 4,
                     "max": 256,
                     "step": 4,
-                    "tooltip": "LoRA rank for SVD decomposition. Higher = more accurate but larger file. Ignored if 'extra_ranks' is filled in."
+                    "tooltip": "LoRA rank for SVD decomposition. Higher = more accurate but larger file. Used only when none of the rank toggles below are ticked."
                 }),
-                "extra_ranks": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional: comma-separated ranks to save in ONE pass, e.g. '16, 32, 64, 128'. "
-                               "The SVD runs once per layer and is sliced per rank, so N ranks cost "
-                               "roughly the same as one. Writes one file per rank. Leave empty to use output_rank."
-                }),
+                "also_8": ("BOOLEAN", {"default": False, "label_on": "8", "label_off": "8",
+                                       "tooltip": "Also save a rank-8 LoRA from the same SVD."}),
+                "also_16": ("BOOLEAN", {"default": False, "label_on": "16", "label_off": "16",
+                                        "tooltip": "Also save a rank-16 LoRA from the same SVD."}),
+                "also_32": ("BOOLEAN", {"default": False, "label_on": "32", "label_off": "32",
+                                        "tooltip": "Also save a rank-32 LoRA from the same SVD."}),
+                "also_64": ("BOOLEAN", {"default": False, "label_on": "64", "label_off": "64",
+                                        "tooltip": "Also save a rank-64 LoRA from the same SVD."}),
+                "also_128": ("BOOLEAN", {"default": False, "label_on": "128", "label_off": "128",
+                                         "tooltip": "Also save a rank-128 LoRA from the same SVD."}),
+                "also_256": ("BOOLEAN", {"default": False, "label_on": "256", "label_off": "256",
+                                         "tooltip": "Also save a rank-256 LoRA from the same SVD."}),
                 "output_path": ("STRING", {
                     "default": last_save_path,
                     "tooltip": "Save directory. Leave empty for ComfyUI/output/extracted_loras. Remembers last used path."
@@ -517,7 +507,9 @@ into a single distributable LoRA file.
 Connect your original base model to 'model_before' and the final
 processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."""
 
-    def extract_lora(self, enabled, model_before, model_after, output_rank, output_path, output_name, extra_ranks=""):
+    def extract_lora(self, enabled, model_before, model_after, output_rank, output_path, output_name,
+                     also_8=False, also_16=False, also_32=False,
+                     also_64=False, also_128=False, also_256=False):
         # Skip if disabled
         if not enabled:
             print("[Model Diff to LoRA] Extraction disabled, skipping")
@@ -526,7 +518,11 @@ processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."
         # Minimum difference threshold - filters out unchanged layers (hardcoded)
         min_diff_threshold = 0.001
 
-        rank_list = _parse_ranks(extra_ranks, output_rank)
+        # Ranks to export: every ticked box, plus output_rank when nothing is ticked.
+        # Ticking nothing therefore reproduces the old single-rank behaviour exactly.
+        ticked = [r for r, on in ((8, also_8), (16, also_16), (32, also_32),
+                                  (64, also_64), (128, also_128), (256, also_256)) if on]
+        rank_list = sorted(set(ticked)) if ticked else [int(output_rank)]
         multi = len(rank_list) > 1
         if multi:
             print(f"[Model Diff to LoRA] Starting MULTI-RANK extraction: {rank_list} "
