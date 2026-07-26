@@ -240,6 +240,82 @@ def _svd_decompose(weight_diff: torch.Tensor, rank: int, device: str = 'cpu') ->
         return None, None
 
 
+def _svd_decompose_multi(weight_diff: torch.Tensor, ranks: list, device: str = 'cpu') -> dict:
+    """
+    Decompose ONCE and emit factors for several ranks.
+
+    SVD returns singular values in descending order, so a rank-r truncation is just the
+    first r columns/rows of the same decomposition — every extra rank costs a slice and a
+    scale, not another SVD. That's the whole point: extracting ranks 16/32/64/128 this way
+    costs essentially the same as extracting rank 128 alone, instead of 4x the work.
+
+    Args:
+        weight_diff: The difference tensor to decompose
+        ranks: Target ranks (any order; deduplicated internally)
+        device: Device to perform SVD on
+
+    Returns:
+        {rank: (lora_up, lora_down)} on CPU. Ranks larger than the matrix are clamped, so
+        two requested ranks can collapse onto the same effective rank — the caller keeps
+        them keyed by what was ASKED for, so every requested file stays complete.
+    """
+    original_shape = weight_diff.shape
+
+    if len(original_shape) == 4:
+        weight_2d = weight_diff.view(original_shape[0], -1)
+    elif len(original_shape) == 2:
+        weight_2d = weight_diff
+    elif len(original_shape) == 1:
+        return {}
+    else:
+        weight_2d = weight_diff.view(original_shape[0], -1)
+
+    m, n = weight_2d.shape
+    max_possible = min(m, n)
+    wanted = sorted({int(r) for r in ranks if int(r) >= 1})
+    if not wanted or max_possible < 1:
+        return {}
+
+    try:
+        weight_2d = weight_2d.to(device=device, dtype=torch.float32)
+        # One decomposition, computed to the largest rank we'll need.
+        U, S, Vh = torch.linalg.svd(weight_2d, full_matrices=False)
+
+        out = {}
+        for r in wanted:
+            actual = min(r, max_possible)
+            if actual < 1:
+                continue
+            U_r = U[:, :actual]
+            S_r = S[:actual]
+            Vh_r = Vh[:actual, :]
+            sqrt_S = torch.sqrt(S_r)
+            up = (U_r * sqrt_S.unsqueeze(0)).to(dtype=torch.float16, device='cpu').contiguous()
+            down = (sqrt_S.unsqueeze(1) * Vh_r).to(dtype=torch.float16, device='cpu').contiguous()
+            out[r] = (up, down)
+        return out
+
+    except Exception as e:
+        print(f"[Model Diff to LoRA] SVD failed: {e}")
+        return {}
+
+
+def _parse_ranks(text: str, fallback: int) -> list:
+    """Parse '16, 32, 64, 128' into [16, 32, 64, 128]. Junk entries are ignored; an empty
+    or fully-invalid string falls back to the single-rank widget value."""
+    out = []
+    for part in re.split(r'[,\s]+', str(text or '')):
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except ValueError:
+            continue
+        if v >= 1:
+            out.append(v)
+    return sorted(set(out)) if out else [int(fallback)]
+
+
 def _model_key_to_lora_key(model_key: str, architecture: str) -> str:
     """
     Transform a model weight key to LoRA naming convention.
@@ -258,7 +334,10 @@ def _model_key_to_lora_key(model_key: str, architecture: str) -> str:
     lora_base = base_key.replace('.', '_')
 
     # Add appropriate prefix based on architecture
-    if architecture in ('ZIMAGE', 'FLUX', 'FLUX_KLEIN_4B', 'FLUX_KLEIN_9B', 'WAN', 'QWEN_IMAGE'):
+    # KREA2 uses the same kohya convention (lora_unet_ + flattened module path), which is
+    # exactly what Fizgig's Krea 2 trainer emits and what ComfyUI's loader expects —
+    # e.g. blocks.0.attn.wq.weight -> lora_unet_blocks_0_attn_wq
+    if architecture in ('ZIMAGE', 'FLUX', 'FLUX_KLEIN_4B', 'FLUX_KLEIN_9B', 'WAN', 'QWEN_IMAGE', 'KREA2'):
         # These use diffusion_model prefix in the model
         if not lora_base.startswith('lora_'):
             lora_base = f"lora_unet_{lora_base}"
@@ -275,6 +354,16 @@ def _detect_architecture_from_keys(keys: list) -> str:
     Uses patterns from lora_analyzer_v2.py.
     """
     keys_lower = [k.lower() for k in keys]
+
+    # Krea 2 (12.9B single-stream MMDiT): blocks.N.attn.{wq,wk,wv,gate,wo} +
+    # blocks.N.mlp.{gate,up,down}, plus a txtfusion stack that fuses the text embeddings.
+    # Checked FIRST: 'txtfusion' is unique to Krea 2, and the generic 'blocks.' patterns
+    # further down would otherwise swallow it (or leave it UNKNOWN, which drops the
+    # lora_unet_ prefix and produces a file ComfyUI can't load).
+    if any('txtfusion' in k for k in keys_lower):
+        return 'KREA2'
+    if any(re.search(r'blocks[._]\d+[._]attn[._]w[qkv]', k) for k in keys_lower):
+        return 'KREA2'
 
     # Qwen-Image: transformer_blocks.N with img_mlp/txt_mlp/img_mod/txt_mod
     # Must check BEFORE FLUX since both have transformer_blocks
@@ -392,7 +481,13 @@ class ModelDiffToLoRA:
                     "min": 4,
                     "max": 256,
                     "step": 4,
-                    "tooltip": "LoRA rank for SVD decomposition. Higher = more accurate but larger file."
+                    "tooltip": "LoRA rank for SVD decomposition. Higher = more accurate but larger file. Ignored if 'extra_ranks' is filled in."
+                }),
+                "extra_ranks": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional: comma-separated ranks to save in ONE pass, e.g. '16, 32, 64, 128'. "
+                               "The SVD runs once per layer and is sliced per rank, so N ranks cost "
+                               "roughly the same as one. Writes one file per rank. Leave empty to use output_rank."
                 }),
                 "output_path": ("STRING", {
                     "default": last_save_path,
@@ -422,7 +517,7 @@ into a single distributable LoRA file.
 Connect your original base model to 'model_before' and the final
 processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."""
 
-    def extract_lora(self, enabled, model_before, model_after, output_rank, output_path, output_name):
+    def extract_lora(self, enabled, model_before, model_after, output_rank, output_path, output_name, extra_ranks=""):
         # Skip if disabled
         if not enabled:
             print("[Model Diff to LoRA] Extraction disabled, skipping")
@@ -431,7 +526,13 @@ processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."
         # Minimum difference threshold - filters out unchanged layers (hardcoded)
         min_diff_threshold = 0.001
 
-        print(f"[Model Diff to LoRA] Starting extraction with rank={output_rank}")
+        rank_list = _parse_ranks(extra_ranks, output_rank)
+        multi = len(rank_list) > 1
+        if multi:
+            print(f"[Model Diff to LoRA] Starting MULTI-RANK extraction: {rank_list} "
+                  f"(one SVD per layer, sliced per rank)")
+        else:
+            print(f"[Model Diff to LoRA] Starting extraction with rank={rank_list[0]}")
 
         # Extract state dicts (moves to CPU)
         # Both models get patches applied to capture effective weights
@@ -453,8 +554,10 @@ processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."
         svd_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"[Model Diff to LoRA] Using {svd_device.upper()} for SVD decomposition")
 
-        # Compute differences and decompose
-        lora_dict = {}
+        # Compute differences and decompose. One dict per requested rank — they share the
+        # same SVD per layer, so the extra ranks are almost free.
+        lora_dicts = {r: {} for r in rank_list}
+        lora_dict = lora_dicts[rank_list[0]]   # back-compat alias for the stats below
         layers_extracted = 0
         layers_skipped_threshold = 0
         layers_skipped_decompose = 0
@@ -491,10 +594,10 @@ processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."
 
             total_diff_norm += diff_norm
 
-            # SVD decompose (on GPU if available)
-            lora_up, lora_down = _svd_decompose(diff, output_rank, device=svd_device)
+            # SVD decompose ONCE, slice to every requested rank (on GPU if available)
+            factors = _svd_decompose_multi(diff, rank_list, device=svd_device)
 
-            if lora_up is None or lora_down is None:
+            if not factors:
                 layers_skipped_decompose += 1
                 print(f"[Model Diff to LoRA] [{i+1}/{total_keys}] {key} - SKIP (SVD failed)")
                 pbar.update(1)
@@ -503,12 +606,14 @@ processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."
             # Generate LoRA keys
             lora_base = _model_key_to_lora_key(key, architecture)
 
-            # Store with lora_up/lora_down naming
-            lora_dict[f"{lora_base}.lora_up.weight"] = lora_up
-            lora_dict[f"{lora_base}.lora_down.weight"] = lora_down
+            for r, (lora_up, lora_down) in factors.items():
+                lora_dicts[r][f"{lora_base}.lora_up.weight"] = lora_up
+                lora_dicts[r][f"{lora_base}.lora_down.weight"] = lora_down
 
             layers_extracted += 1
-            print(f"[Model Diff to LoRA] [{i+1}/{total_keys}] {key} - EXTRACTED (diff={diff_norm:.4f}, rank={min(output_rank, min(lora_up.shape))})")
+            _eff = sorted({min(u.shape) for u, _ in factors.values()})
+            print(f"[Model Diff to LoRA] [{i+1}/{total_keys}] {key} - EXTRACTED "
+                  f"(diff={diff_norm:.4f}, rank(s)={_eff if multi else _eff[0]})")
 
             # Clean up intermediate tensors
             del diff
@@ -564,33 +669,49 @@ processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."
                 base_name = base_name[:-12]
         else:
             base_name = "extracted_lora"
-        filename = f"{base_name}_{timestamp}.safetensors"
-
-        full_path = os.path.join(output_path, filename)
-
-        # Prepare metadata
-        metadata = {
-            "ss_network_module": "lora",
-            "ss_network_dim": str(output_rank),
-            "ss_network_alpha": str(output_rank),
-            "ss_base_model_version": architecture,
-            "modelspec.title": f"Extracted LoRA - {output_name or 'unnamed'}",
-            "modelspec.architecture": architecture.lower(),
-            "extraction_method": "svd_diff",
-            "extraction_rank": str(output_rank),
-            "source_layers": str(layers_extracted),
-            "extraction_date": datetime.now().isoformat(),
-            "extracted_by": "comfyui-zimage-realtime-lora ModelDiffToLoRA",
-            "extracted_url": "https://github.com/ShootTheSound/comfyUI-Realtime-Lora",
-        }
-
-        # Save LoRA
-        print(f"[Model Diff to LoRA] Saving to {full_path}...")
+        # One file per requested rank. Multi-rank runs get the rank in the filename so a
+        # ladder (16/32/64/128) lands as a comparable set from a single extraction.
+        saved_paths, saved_sizes = [], []
         try:
-            save_file(lora_dict, full_path, metadata=metadata)
-            print(f"[Model Diff to LoRA] Saved successfully!")
+            for r in rank_list:
+                rank_dict = lora_dicts[r]
+                if not rank_dict:
+                    continue
+                # Rank always goes in the name — a single extraction's ladder then sorts
+                # together (same base+timestamp) and differs only by the trailing rank.
+                filename = f"{base_name}_{timestamp}_r{r}.safetensors"
+                path_r = os.path.join(output_path, filename)
 
-            # Remember the save path and filename for next time
+                metadata = {
+                    "ss_network_module": "lora",
+                    "ss_network_dim": str(r),
+                    "ss_network_alpha": str(r),
+                    "ss_base_model_version": architecture,
+                    "modelspec.title": f"Extracted LoRA - {output_name or 'unnamed'} (rank {r})",
+                    "modelspec.architecture": architecture.lower(),
+                    "extraction_method": "svd_diff",
+                    "extraction_rank": str(r),
+                    "source_layers": str(layers_extracted),
+                    "extraction_date": datetime.now().isoformat(),
+                    "extracted_by": "comfyui-zimage-realtime-lora ModelDiffToLoRA",
+                    "extracted_url": "https://github.com/ShootTheSound/comfyUI-Realtime-Lora",
+                }
+                if multi:
+                    # Same SVD, different truncation — record the sibling set so a later
+                    # comparison knows these are the same extraction at different ranks.
+                    metadata["extraction_rank_set"] = ",".join(str(x) for x in rank_list)
+
+                print(f"[Model Diff to LoRA] Saving rank {r} -> {path_r}...")
+                save_file(rank_dict, path_r, metadata=metadata)
+                saved_paths.append(path_r)
+                saved_sizes.append(os.path.getsize(path_r) / (1024 * 1024))
+
+            if not saved_paths:
+                info = "No files written (nothing to save)"
+                print(f"[Model Diff to LoRA] {info}")
+                return {"ui": {"auto_disable": [False]}, "result": ("", info)}
+
+            print(f"[Model Diff to LoRA] Saved {len(saved_paths)} file(s) successfully!")
             _save_save_config(output_path, base_name)
 
         except Exception as e:
@@ -598,17 +719,25 @@ processed model (after V2 analyzers, selective loaders, etc.) to 'model_after'."
             print(f"[Model Diff to LoRA] {info}")
             return {"ui": {"auto_disable": [False]}, "result": ("", info)}
 
+        # The primary return stays the LARGEST rank, so a chained loader gets the most
+        # faithful file by default.
+        full_path = saved_paths[-1]
+        filename = os.path.basename(full_path)
+
         # Build info string
         file_size_mb = os.path.getsize(full_path) / (1024 * 1024)
         info_lines = [
-            f"Extracted LoRA saved: {filename}",
+            (f"Extracted {len(saved_paths)} LoRAs (ranks {', '.join(str(r) for r in rank_list)})"
+             if multi else f"Extracted LoRA saved: {filename}"),
             f"Architecture: {architecture}",
             f"Layers extracted: {layers_extracted}",
             f"Layers skipped (below threshold): {layers_skipped_threshold}",
             f"Layers skipped (not trainable): {len(common_keys) - len(trainable_keys)}",
-            f"Output rank: {output_rank}",
+            (f"Ranks: {', '.join(str(r) for r in rank_list)} (one SVD, sliced per rank)"
+             if multi else f"Output rank: {rank_list[0]}"),
             f"Compression ratio: {compression_ratio:.1f}x",
-            f"File size: {file_size_mb:.2f} MB",
+            (f"File sizes: {', '.join(f'r{r}={sz:.1f}MB' for r, sz in zip(rank_list, saved_sizes))}"
+             if multi else f"File size: {file_size_mb:.2f} MB"),
             f"Total diff norm: {total_diff_norm:.4f}",
             f"SVD device: {svd_device.upper()}",
         ]

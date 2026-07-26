@@ -67,9 +67,10 @@ It's not LoRAs-only. The node captures any difference between the two `MODEL` ob
 | `enabled` | BOOLEAN | Run the extraction when queued. Default **on**; it auto-disables after a successful save so it sits dormant until you re-enable it. |
 | `model_before` | MODEL | The baseline (unmodified) model |
 | `model_after` | MODEL | The same model with whatever edits applied |
-| `output_rank` | INT | Target LoRA rank (default 64, range 4–256; higher = more faithful, larger file) |
+| `output_rank` | INT | Target LoRA rank (default 64, range 4–256; higher = more faithful, larger file). Ignored when `extra_ranks` is filled in. |
+| `extra_ranks` | STRING | Optional. Comma-separated ranks to save in **one pass**, e.g. `16, 32, 64, 128`. Writes one file per rank. Leave empty to use `output_rank`. |
 | `output_path` | STRING | Save directory. Leave empty for `ComfyUI/output/extracted_loras`. Remembers the last path you used. |
-| `output_name` | STRING | Filename prefix for the saved `.safetensors` (a timestamp is appended). Remembers the last name you used. |
+| `output_name` | STRING | Filename prefix. Saved files are `<name>_<timestamp>_r<rank>.safetensors`. Remembers the last name you used. |
 
 The SVD device is chosen automatically — CUDA if a GPU is available, otherwise CPU. Layers whose difference is essentially numerical noise are skipped automatically (internal threshold) to keep the file small.
 
@@ -92,7 +93,9 @@ No pip installs needed beyond what ComfyUI already ships with.
 ## Notes
 
 - **Rank choice.** Higher `output_rank` = larger file but closer reproduction of the diff. For most edits, rank 16–32 captures >95% of the signal; for very subtle edits, rank 4 may be enough. Default is 64.
+- **Comparing ranks costs almost nothing.** SVD returns singular values in descending order, so a lower rank is just a truncation of the same decomposition. Put `16, 32, 64, 128` in `extra_ranks` and the node runs **one SVD per layer** and slices it, producing all four files for roughly the cost of one — then you can A/B them and keep the smallest that still holds up. (Each file is bit-identical to extracting that rank on its own.)
 - **Noise threshold.** Layers whose difference is essentially numerical noise are skipped automatically so the file stays small — this is handled internally, nothing to configure.
+- **Architecture is auto-detected** from the model's key names, and the LoRA is written with the matching `lora_unet_` naming so ComfyUI loads it back without conversion. Recognised: Flux (incl. Klein 4B / 9B), Krea 2, Qwen-Image, Z-Image, WAN, SDXL and SD 1.5.
 - **GPU SVD.** The device is selected automatically: CUDA when a GPU is available, otherwise CPU. On big models (Flux, SDXL) CPU SVD can take minutes while CUDA is typically seconds to tens of seconds.
 - **Auto-disable.** `enabled` is on by default and turns itself off after a successful save, so the node won't silently re-extract on your next Queue — flip it back on when you want to run again.
 - **The node honours patches.** ComfyUI applies LoRAs and other modifications as `model_patcher.patches` rather than baking them into weights. This node detects patches on the input MODEL objects and applies them via `comfy.lora.calculate_weight()` before computing the diff — so your chained LoRAs and runtime patches are correctly captured.
