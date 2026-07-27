@@ -67,8 +67,7 @@ It's not LoRAs-only. The node captures any difference between the two `MODEL` ob
 | `enabled` | BOOLEAN | Run the extraction when queued. Default **on**; it auto-disables after a successful save so it sits dormant until you re-enable it. |
 | `model_before` | MODEL | The baseline (unmodified) model |
 | `model_after` | MODEL | The same model with whatever edits applied |
-| `output_rank` | INT | Target LoRA rank (default 64, range 4–256; higher = more faithful, larger file). Used only when no rank toggles are ticked. |
-| `8` / `16` / `32` / `64` / `128` / `256` | BOOLEAN | Tick any ranks you want exported. All ticked ranks are saved in **one pass** (one file each) from a single SVD. Tick none and `output_rank` is used. |
+| `8` / `16` / `32` / `64` / `128` / `256` | BOOLEAN | Tick the ranks you want. Every ticked rank is saved as its own file, all from a **single SVD pass**. Defaults to 32 + 64. |
 | `output_path` | STRING | Save directory. Leave empty for `ComfyUI/output/extracted_loras`. Remembers the last path you used. |
 | `output_name` | STRING | Filename prefix. Saved files are `<name>_<timestamp>_r<rank>.safetensors`. Remembers the last name you used. |
 
